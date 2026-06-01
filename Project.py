@@ -29,8 +29,8 @@ import matplotlib.cm as cm
 # ─────────────────────────────────────────────
 
 RPC_URL       = "https://mainnet.era.zksync.io"
-START_BLOCK   = 60_000_000
-NUM_BLOCKS    = 5_000
+START_BLOCK   = 67670670
+NUM_BLOCKS    = 5000
 CONCURRENCY   = 10
 LP_ITERATIONS = 30
 CACHE_FILE    = "blocks_cache.pkl"
@@ -63,10 +63,10 @@ async def download_block(session, semaphore, block_number):
 
 
 async def download_all_blocks():
-    if os.path.exists(CACHE_FILE):
+    """if os.path.exists(CACHE_FILE):
         print(f"[cache] Loading blocks from {CACHE_FILE}")
         with open(CACHE_FILE, "rb") as f:
-            return pickle.load(f)
+            return pickle.load(f)"""
 
     semaphore = asyncio.Semaphore(CONCURRENCY)
     blocks = []
@@ -206,6 +206,7 @@ def weighted_label_propagation(G: nx.Graph, iterations: int) -> dict:
 
             if  best_label != labels[v]:
                 labels[v] = best_label
+                """make the one with the most connections first. Then random"""
                 changed += 1
 
         print(f"  LP iter {iteration:3d}/{iterations}  changes={changed:6d}", end="\r")
