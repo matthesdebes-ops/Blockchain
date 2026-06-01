@@ -1,34 +1,21 @@
 
-from web3 import Web3
 import asyncio
 import aiohttp
-
+from web3 import Web3
 
 RPC_URL = "https://mainnet.era.zksync.io"
 TOKEN_ADDRESS = "0x3355df6D4c9C3035724Fd0e3914dE96A5a83aaf4"
-NUMBER_OF_BLOCKS = 20
 
-CONCURRENCY = 5
+CONCURRENCY = 10
+
 
 ERC20_ABI = [
     {
         "anonymous": False,
         "inputs": [
-            {
-                "indexed": True,
-                "name": "from",
-                "type": "address",
-            },
-            {
-                "indexed": True,
-                "name": "to",
-                "type": "address",
-            },
-            {
-                "indexed": False,
-                "name": "value",
-                "type": "uint256",
-            },
+            {"indexed": True, "name": "from", "type": "address"},
+            {"indexed": True, "name": "to", "type": "address"},
+            {"indexed": False, "name": "value", "type": "uint256"},
         ],
         "name": "Transfer",
         "type": "event",
@@ -36,84 +23,21 @@ ERC20_ABI = [
     {
         "inputs": [],
         "name": "decimals",
-        "outputs": [
-            {
-                "name": "",
-                "type": "uint8",
-            }
-        ],
+        "outputs": [{"name": "", "type": "uint8"}],
         "stateMutability": "view",
         "type": "function",
     },
     {
         "inputs": [],
         "name": "symbol",
-        "outputs": [
-            {
-                "name": "",
-                "type": "string",
-            }
-        ],
+        "outputs": [{"name": "", "type": "string"}],
         "stateMutability": "view",
         "type": "function",
     },
 ]
 
 
-w3 = Web3(Web3.HTTPProvider(RPC_URL))
-
-token = w3.eth.contract(
-    address=Web3.to_checksum_address(TOKEN_ADDRESS),
-    abi=ERC20_ABI,
-)
-
-latest_block = w3.eth.block_number
-
-from_block = latest_block - 200
-to_block = latest_block
-
-symbol = token.functions.symbol().call()
-decimals = token.functions.decimals().call()
-
-print("Token:", symbol)
-print("Decimals:", decimals)
-print("Contract:", TOKEN_ADDRESS)
-print("Block range:", from_block, "to", to_block)
-
-transfer_topic = w3.keccak(text="Transfer(address,address,uint256)").hex()
-
-logs = w3.eth.get_logs(
-    {
-        "address": Web3.to_checksum_address(TOKEN_ADDRESS),
-        "fromBlock": from_block,
-        "toBlock": to_block,
-        "topics": [transfer_topic],
-    }
-)
-
-print("\nRaw logs found:", len(logs))
-
-for raw_log in logs[:20]:
-    event = token.events.Transfer().process_log(raw_log)
-
-    from_address = event["args"]["from"]
-    to_address = event["args"]["to"]
-    raw_value = event["args"]["value"]
-    human_value = raw_value / (10 ** decimals)
-
-    print("\nTransfer event")
-    print("  block:", event["blockNumber"])
-    print("  tx:", event["transactionHash"].hex())
-    print("  from:", from_address)
-    print("  to:", to_address)
-    print("  raw value:", raw_value)
-    print("  human value:", human_value, symbol)
 async def rpc_call(session, method, params, request_id):
-    """
-    Send one JSON-RPC request.
-
-    This is intentionally small and simple for teaching.
-    """
     body = {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -123,70 +47,115 @@ async def rpc_call(session, method, params, request_id):
 
     async with session.post(RPC_URL, json=body) as response:
         data = await response.json()
+        if "error" in data:
+            raise Exception(f"RPC Error: {data['error']}")
         return data["result"]
 
 
-async def download_block(session, semaphore, block_number):
-    """
-    Download one block by number.
-
-    The semaphore keeps only CONCURRENCY requests active at the same time.
-    """
+async def get_logs_for_range(session, semaphore, token_address, from_block, to_block, topics, range_id):
     async with semaphore:
-        block_number_hex = hex(block_number)
-
-        block = await rpc_call(
+        result = await rpc_call(
             session=session,
-            method="eth_getBlockByNumber",
-            params=[block_number_hex, False],  # False = transaction hashes only
-            request_id=block_number,
+            method="eth_getLogs",
+            params=[{
+                "address": token_address,
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "topics": topics,
+            }],
+            request_id=range_id,
         )
 
-        return block
+        return result
 
 
 async def main():
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    token = w3.eth.contract(
+        address=Web3.to_checksum_address(TOKEN_ADDRESS),
+        abi=ERC20_ABI,
+    )
+
+    symbol = token.functions.symbol().call()
+    decimals = token.functions.decimals().call()
+
+    latest_block = w3.eth.block_number
+    from_block = latest_block - 200
+    to_block = latest_block
+
+    print("Token:", symbol)
+    print("Decimals:", decimals)
+    print("Contract:", TOKEN_ADDRESS)
+    print("Block range:", from_block, "to", to_block)
+
+    transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+    topics = [transfer_topic]
+    BLOCKS_PER_CHUNK = 50  # Jede Anfrage holt max. 50 Blöcke
+    total_blocks = to_block - from_block
+    num_chunks = max(1, total_blocks // BLOCKS_PER_CHUNK)
+
+    chunks = []
+    for i in range(num_chunks):
+        start = from_block + i * BLOCKS_PER_CHUNK
+        end = min(start + BLOCKS_PER_CHUNK - 1, to_block)
+        if start <= end:
+            chunks.append((start, end, i))
+
+    print(f"\nDivide {total_blocks} Blocks into {len(chunks)} parallel requests")
     semaphore = asyncio.Semaphore(CONCURRENCY)
 
-    # One ClientSession for the whole program.
-    # This allows aiohttp to reuse connections.
     async with aiohttp.ClientSession() as session:
-        latest_block_hex = await rpc_call(
-            session=session,
-            method="eth_blockNumber",
-            params=[],
-            request_id=1,
-        )
-
-        latest_block = int(latest_block_hex, 16)
-
-        print("Latest block:", latest_block)
-
-        # Build a list of block numbers:
-        # latest, latest - 1, latest - 2, ...
-        block_numbers = []
-        for n in range(NUMBER_OF_BLOCKS):
-            block_numbers.append(latest_block - n)
-
-        # Create one async task per block.
         tasks = []
-        for block_number in block_numbers:
-            task = download_block(session, semaphore, block_number)
+        for start_block, end_block, chunk_id in chunks:
+            task = get_logs_for_range(
+                session=session,
+                semaphore=semaphore,
+                token_address=TOKEN_ADDRESS,
+                from_block=start_block,
+                to_block=end_block,
+                topics=topics,
+                range_id=chunk_id
+            )
             tasks.append(task)
 
-        # Run all tasks concurrently.
-        blocks = await asyncio.gather(*tasks)
+        all_logs_chunks = await asyncio.gather(*tasks)
 
-    # Sort results because concurrent requests may finish in any order.
-    blocks.sort(key=lambda block: int(block["number"], 16))
+    logs = []
+    for chunk_logs in all_logs_chunks:
+        if chunk_logs:
+            logs.extend(chunk_logs)
 
-    print("\nDownloaded blocks:")
-    for block in blocks:
-        number = int(block["number"], 16)
-        tx_count = len(block["transactions"])
-        block_hash = block["hash"]
+    print(f"\nRaw logs found: {len(logs)}")
 
-        print(f"  block={number} txs={tx_count} hash={block_hash}")
+    for raw_log in logs:
+
+        formatted_log = {
+            "address": Web3.to_checksum_address(raw_log["address"]),
+            "blockHash": bytes.fromhex(raw_log["blockHash"][2:]),
+            "blockNumber": int(raw_log["blockNumber"], 16),
+            "data": raw_log["data"],
+            "logIndex": int(raw_log["logIndex"], 16),
+            "removed": raw_log.get("removed", False),
+            "topics": [bytes.fromhex(t[2:]) for t in raw_log["topics"]],
+            "transactionHash": bytes.fromhex(raw_log["transactionHash"][2:]),
+            "transactionIndex": int(raw_log["transactionIndex"], 16),
+        }
+
+        event = token.events.Transfer().process_log(formatted_log)
+
+        from_address = event["args"]["from"]
+        to_address = event["args"]["to"]
+        raw_value = event["args"]["value"]
+        human_value = raw_value / (10 ** decimals)
+
+        print("\nTransfer event")
+        print("  block:", event["blockNumber"])
+        print("  tx:", event["transactionHash"].hex())
+        print("  from:", from_address)
+        print("  to:", to_address)
+        print("  raw value:", raw_value)
+        print("  human value:", human_value, symbol)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
