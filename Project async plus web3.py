@@ -70,7 +70,7 @@ async def get_logs_for_range(session, semaphore, token_address, from_block, to_b
 
 
 async def main():
-    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    w3 = AsyncWeb3(AsyncHTTPProvider(RPC_URL))
     token = w3.eth.contract(
         address=Web3.to_checksum_address(TOKEN_ADDRESS),
         abi=ERC20_ABI,
