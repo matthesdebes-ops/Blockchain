@@ -90,7 +90,7 @@ async def main():
 
     transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)").hex()
     topics = [transfer_topic]
-    BLOCKS_PER_CHUNK = 50  # Jede Anfrage holt max. 50 Blöcke
+    BLOCKS_PER_CHUNK = 50
     total_blocks = to_block - from_block
     num_chunks = max(1, total_blocks // BLOCKS_PER_CHUNK)
 
