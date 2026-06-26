@@ -3,6 +3,7 @@ create_interactive_graph_full.py
 
 Create an interactive HTML visualization of the zkSync transaction network.
 Each log file is processed separately, producing one HTML file per dataset.
+Sampling ensures a maximum of 10,000 nodes for performance.
 """
 
 import pickle
@@ -11,6 +12,8 @@ import networkx as nx
 import numpy as np
 from typing import List, Dict
 import gc
+import random
+from pyvis.network import Network
 
 # ----------------------------------------------------------------------
 # Configuration
@@ -22,6 +25,8 @@ LOG_FILES = [
     "logs_69900000_70000000_final.pkl",
     "logs_14900000_15000000_final.pkl",
 ]
+
+MAX_NODES = 10000  # Maximum nodes to display in the interactive graph
 
 # ----------------------------------------------------------------------
 # 1. Load logs
@@ -43,11 +48,11 @@ def load_logs(file_path: str) -> List[Dict]:
 
 
 # ----------------------------------------------------------------------
-# 2. Build graph and get largest component
+# 2. Build graph and sample nodes
 # ----------------------------------------------------------------------
 
-def get_largest_component(logs: List[Dict]) -> nx.Graph:
-    """Build graph from logs and return the largest connected component"""
+def build_sampled_graph(logs: List[Dict], max_nodes: int = 10000) -> nx.Graph:
+    """Build graph from logs, sample to max_nodes, and return largest component"""
 
     print("\n  Building graph...")
     edges = []
@@ -57,17 +62,71 @@ def get_largest_component(logs: List[Dict]) -> nx.Graph:
         if sender and receiver and sender != receiver:
             edges.append((sender, receiver))
 
+    # Count edges to build degree distribution
     G = nx.Graph()
     G.add_edges_from(edges)
-    print(f"  Total nodes: {G.number_of_nodes():,}")
-    print(f"  Total edges: {G.number_of_edges():,}")
+    print(f"  Total nodes in full graph: {G.number_of_nodes():,}")
+    print(f"  Total edges in full graph: {G.number_of_edges():,}")
 
-    print("\n  Finding largest connected component...")
-    largest_nodes = max(nx.connected_components(G), key=len)
-    print(f"  LCC size: {len(largest_nodes):,} nodes")
+    # If graph is already small enough, just find LCC
+    if G.number_of_nodes() <= max_nodes:
+        print("\n  Finding largest connected component...")
+        largest_nodes = max(nx.connected_components(G), key=len)
+        print(f"  LCC size: {len(largest_nodes):,} nodes")
+        lcc = G.subgraph(largest_nodes).copy()
+        del G, edges
+        gc.collect()
+        return lcc
 
-    lcc = G.subgraph(largest_nodes).copy()
-    del G, edges
+    # Sample nodes based on degree
+    print(f"\n  Sampling {max_nodes:,} nodes from full graph...")
+
+    # Get degree for all nodes
+    degrees = dict(G.degree())
+
+    # Sort nodes by degree (high to low)
+    sorted_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
+
+    # Strategy: Take top high-degree nodes + random sample from rest
+    high_degree_count = min(max_nodes // 2, len(sorted_nodes))
+    high_degree_nodes = [node for node, deg in sorted_nodes[:high_degree_count]]
+
+    # Remaining nodes to sample
+    remaining_quota = max_nodes - len(high_degree_nodes)
+    remaining_nodes = [node for node, deg in sorted_nodes[high_degree_count:]]
+
+    if remaining_nodes and remaining_quota > 0:
+        sample_size = min(remaining_quota, len(remaining_nodes))
+        sampled_remaining = random.sample(remaining_nodes, sample_size)
+    else:
+        sampled_remaining = []
+
+    # Combine selected nodes
+    selected_nodes = set(high_degree_nodes + sampled_remaining)
+    print(f"  Selected {len(selected_nodes):,} nodes for sampling")
+
+    # Create subgraph with selected nodes
+    sampled_G = G.subgraph(selected_nodes).copy()
+
+    # If still too many, take top degree nodes
+    if sampled_G.number_of_nodes() > max_nodes:
+        print(f"  Still over limit, taking top {max_nodes:,} degree nodes...")
+        top_nodes = sorted(sampled_G.degree(), key=lambda x: x[1], reverse=True)[:max_nodes]
+        sampled_G = G.subgraph([node for node, deg in top_nodes]).copy()
+
+    print(f"  Sampled graph nodes: {sampled_G.number_of_nodes():,}")
+    print(f"  Sampled graph edges: {sampled_G.number_of_edges():,}")
+
+    # Now find largest connected component in sampled graph
+    print("\n  Finding largest connected component in sampled graph...")
+    if sampled_G.number_of_nodes() > 0:
+        largest_nodes = max(nx.connected_components(sampled_G), key=len)
+        print(f"  LCC size: {len(largest_nodes):,} nodes")
+        lcc = sampled_G.subgraph(largest_nodes).copy()
+    else:
+        lcc = sampled_G
+
+    del G, sampled_G, edges
     gc.collect()
 
     return lcc
@@ -80,19 +139,15 @@ def get_largest_component(logs: List[Dict]) -> nx.Graph:
 def create_html_graph(G: nx.Graph, label: str = ""):
     """Create interactive HTML visualization for a single graph"""
 
-    try:
-        from pyvis.network import Network
-    except ImportError:
-        print("  Installing pyvis...")
-        import subprocess
-        subprocess.check_call(['pip', 'install', 'pyvis'])
-        from pyvis.network import Network
-
     n_nodes = G.number_of_nodes()
     n_edges = G.number_of_edges()
 
     print(f"\n  Creating interactive HTML...")
     print(f"  Nodes: {n_nodes:,}  |  Edges: {n_edges:,}")
+
+    if n_nodes == 0:
+        print("  WARNING: Graph is empty, skipping HTML generation")
+        return None
 
     net = Network(
         height="1200px",
@@ -101,44 +156,61 @@ def create_html_graph(G: nx.Graph, label: str = ""):
         font_color="white"
     )
 
-    net.set_options("""
-    {
-        "physics": {
-            "enabled": true,
-            "stabilization": {
-                "iterations": 500,
+    # Adaptive physics settings based on graph size
+    if n_nodes > 5000:
+        physics_enabled = True
+        iterations = 300
+        spring_length = 250
+        gravitational_constant = -200
+    elif n_nodes > 2000:
+        physics_enabled = True
+        iterations = 400
+        spring_length = 200
+        gravitational_constant = -250
+    else:
+        physics_enabled = True
+        iterations = 500
+        spring_length = 150
+        gravitational_constant = -300
+
+    net.set_options(f"""
+    {{
+        "physics": {{
+            "enabled": {str(physics_enabled).lower()},
+            "stabilization": {{
+                "iterations": {iterations},
                 "updateInterval": 50
-            },
-            "forceAtlas2Based": {
-                "gravitationalConstant": -300,
+            }},
+            "forceAtlas2Based": {{
+                "gravitationalConstant": {gravitational_constant},
                 "centralGravity": 0.005,
-                "springLength": 300,
+                "springLength": {spring_length},
                 "springConstant": 0.05,
                 "damping": 0.4
-            },
+            }},
             "solver": "forceAtlas2Based"
-        },
-        "nodes": {
+        }},
+        "nodes": {{
             "size": 4,
             "shape": "dot",
-            "font": { "size": 0 },
+            "font": {{ "size": 0 }},
             "borderWidth": 0
-        },
-        "edges": {
-            "color": { "color": "rgba(255,255,255,0.08)" },
+        }},
+        "edges": {{
+            "color": {{ "color": "rgba(255,255,255,0.08)" }},
             "width": 0.5,
-            "smooth": { "enabled": false }
-        },
-        "interaction": {
+            "smooth": {{ "enabled": false }}
+        }},
+        "interaction": {{
             "hover": true,
             "tooltipDelay": 100,
             "navigationButtons": true,
             "keyboard": true,
             "zoomView": true,
             "dragView": true
-        },
-        "layout": { "randomSeed": 42 }
-    }
+        }},
+        "layout": {{ "randomSeed": 42 }}
+    }}
     """)
 
     # Degree-based coloring and sizing
@@ -171,20 +243,32 @@ def create_html_graph(G: nx.Graph, label: str = ""):
             print(f"    {i+1:,} nodes added...")
 
     print(f"  Adding {n_edges:,} edges...")
-    if n_edges > 200000:
-        print(f"  WARNING: {n_edges:,} edges is very large — browser may be slow.")
+    edge_threshold = 10000  # Show all edges if under this threshold
+    if n_edges > edge_threshold:
+        print(f"  Note: {n_edges:,} edges - rendering may be slow")
 
+    # Add edges with progress indicator
     for i, (u, v) in enumerate(G.edges()):
-        net.add_edge(u, v, color="rgba(255,255,255,0.05)", width=0.3)
+        # Edge transparency based on count (if too many, make them more transparent)
+        if n_edges > 50000:
+            alpha = 0.03
+        elif n_edges > 20000:
+            alpha = 0.05
+        else:
+            alpha = 0.08
+
+        net.add_edge(u, v, color=f"rgba(255,255,255,{alpha})", width=0.3)
         if (i + 1) % 50000 == 0:
             print(f"    {i+1:,} edges added...")
 
-    html_path = f"zkSync_graph_{label}.html"
+    # Create output filename with node count
+    html_path = f"zkSync_graph_{label}_{n_nodes}_nodes.html"
     print(f"\n  Saving to: {html_path}...")
-    net.show(html_path)
+    net.write_html(html_path)
 
     print(f"  ✓ Saved: {html_path}")
     print(f"  Nodes: {n_nodes:,}  |  Edges: {n_edges:,}")
+    print(f"  File size: {os.path.getsize(html_path) / (1024*1024):.2f} MB")
 
     return html_path
 
@@ -194,9 +278,13 @@ def create_html_graph(G: nx.Graph, label: str = ""):
 # ----------------------------------------------------------------------
 
 def main():
+    # Set random seed for reproducibility
+    random.seed(42)
+
     print("=" * 60)
-    print("ZKSYNC INTERACTIVE GRAPH  (per-file mode)")
+    print("ZKSYNC INTERACTIVE GRAPH  (per-file mode with sampling)")
     print("=" * 60)
+    print(f"\nMax nodes per graph: {MAX_NODES:,}")
 
     for file_name in LOG_FILES:
         label = file_name.replace("_final.pkl", "").replace("logs_", "blocks_")
@@ -210,11 +298,14 @@ def main():
             print(f"  No logs found, skipping.")
             continue
 
-        lcc = get_largest_component(logs)
+        lcc = build_sampled_graph(logs, MAX_NODES)
         del logs
         gc.collect()
 
-        create_html_graph(lcc, label)
+        if lcc and lcc.number_of_nodes() > 0:
+            create_html_graph(lcc, label)
+        else:
+            print("  Graph is empty, skipping HTML generation")
 
         del lcc
         gc.collect()
@@ -224,6 +315,7 @@ def main():
     print("=" * 60)
     print("\nOpen the HTML files in Chrome with extra memory:")
     print('  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --max-old-space-size=8192')
+    print("\nAlternatively, use Firefox for better large graph performance.")
 
 
 if __name__ == "__main__":

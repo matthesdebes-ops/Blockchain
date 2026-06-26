@@ -47,10 +47,8 @@ BLOCK_RANGES = [
 BATCH_SAVE_BLOCKS = 50_000
 
 # Initial chunk size for eth_getLogs calls
-# Keep small — zkSync's 10k result cap triggers on dense ranges
 LOG_CHUNK_SIZE = 200
 
-# Max concurrent requests — public RPC is sensitive; keep this low
 CONCURRENCY = 3
 
 # Retry settings
@@ -58,13 +56,10 @@ MAX_RETRIES = 6          # attempts before giving up
 BASE_BACKOFF = 2.0       # seconds; doubles each retry
 MAX_BACKOFF = 60.0       # cap on wait time
 
-# Transfer topic (ERC-20 Transfer event)
 TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
 
-# Optional: Filter for specific tokens (None = all tokens)
 TOKEN_ADDRESSES = None  # Set to list of addresses to filter
 
-# Output directory
 OUTPUT_DIR = r"D:\zkSync_logs"
 
 # How many block timestamp lookups to bundle into a single HTTP request.
@@ -151,7 +146,7 @@ def save_batch(logs: List[Dict], block_range: Tuple[int, int],
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    print(f"  💾 Batch saved: blocks {batch_start:,}–{batch_end:,} | "
+    print(f" Batch saved: blocks {batch_start:,}–{batch_end:,} | "
           f"{len(logs):,} logs | {size_mb:.1f} MB → {os.path.basename(file_path)}")
 
 
@@ -218,7 +213,7 @@ def save_final(logs: List[Dict], block_range: Tuple[int, int]):
         pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     size_mb = os.path.getsize(final_path) / (1024 * 1024)
-    print(f"\n✅ Final file saved: {final_path} ({size_mb:.1f} MB, {len(logs):,} logs)")
+    print(f"\n Final file saved: {final_path} ({size_mb:.1f} MB, {len(logs):,} logs)")
 
     # Clean up batch files
     batch_files = list_batch_files(block_range)
@@ -271,37 +266,31 @@ def parse_suggested_range(message: str) -> Optional[Tuple[int, int]]:
 # Async RPC functions
 # ----------------------------------------------------------------------
 
-async def rpc_call_raw(session: aiohttp.ClientSession, method: str, params: list,
-                       request_id: str, timeout: int = 60) -> Dict:
-    body = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-    async with session.post(
-        RPC_URL,
-        json=body,
-        timeout=aiohttp.ClientTimeout(total=timeout)
-    ) as response:
-        if response.status == 429:
-            retry_after = float(response.headers.get("Retry-After", 0))
-            raise aiohttp.ClientResponseError(
-                response.request_info, response.history,
-                status=429, message=f"Rate limited (Retry-After: {retry_after}s)"
-            )
-        response.raise_for_status()
-        return await response.json(content_type=None)
-
-
-async def rpc_call(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore,
-                   method: str, params: list, request_id: str,
-                   timeout: int = 60) -> Optional[Any]:
+async def rpc_call(session, semaphore, method, params, request_id, timeout=60):
     async with semaphore:
         for attempt in range(MAX_RETRIES):
             try:
-                data = await rpc_call_raw(session, method, params, request_id, timeout)
+                body = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+                async with session.post(
+                    RPC_URL,
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=timeout)
+                ) as response:
+                    if response.status == 429:
+                        retry_after = float(response.headers.get("Retry-After", 0))
+                        raise aiohttp.ClientResponseError(
+                            response.request_info, response.history,
+                            status=429, message=f"Rate limited (Retry-After: {retry_after}s)"
+                        )
+                    response.raise_for_status()
+                    data = await response.json(content_type=None)
 
                 if "error" in data:
-                    return data  # Pass -32602 etc. back to caller
-
+                    return data
                 return data["result"]
-
+                """
+                    Exception handling
+                """
             except aiohttp.ClientResponseError as e:
                 if e.status == 429:
                     wait = max(
@@ -334,6 +323,9 @@ async def rpc_call(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore,
 async def fetch_log_chunk(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore,
                           from_block: int, to_block: int, chunk_id: str,
                           depth: int = 0) -> List[Dict]:
+    """
+        Log downloading in chunks + chunkssplitting if too many logs in one chunk
+    """
     MAX_DEPTH = 20
 
     if depth > MAX_DEPTH:
@@ -354,7 +346,9 @@ async def fetch_log_chunk(session: aiohttp.ClientSession, semaphore: asyncio.Sem
 
     if result is None:
         return []
-
+    """
+        Exceptions handling
+    """
     if isinstance(result, dict) and "error" in result:
         err = result["error"]
         code = err.get("code")
@@ -423,13 +417,6 @@ async def fetch_timestamps_batch(session: aiohttp.ClientSession,
                                  semaphore: asyncio.Semaphore,
                                  block_numbers: List[int],
                                  batch_size: int = 100) -> Dict[int, int]:
-    """
-    Fetch timestamps for many blocks using JSON-RPC batch requests.
-    Sends up to `batch_size` requests in a single HTTP call instead of
-    one request per block — typically 10–50x faster than the naive approach.
-
-    Returns a dict mapping block_number -> unix timestamp.
-    """
     results: Dict[int, int] = {}
     block_numbers = list(block_numbers)
     total_batches = (len(block_numbers) + batch_size - 1) // batch_size
@@ -663,11 +650,6 @@ def main():
     print(f"Batch size:     {BATCH_SAVE_BLOCKS:,} blocks per batch file")
     print(f"Timestamp RPC:  {TIMESTAMP_BATCH_SIZE} blocks per batch request")
     print(f"Max retries:    {MAX_RETRIES}")
-    if TOKEN_ADDRESSES:
-        print(f"Token filter:   {TOKEN_ADDRESSES}")
-    else:
-        print("Token filter:   none (all ERC-20 transfers)")
-    print()
 
     asyncio.run(download_all_ranges())
 
