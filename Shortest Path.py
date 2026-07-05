@@ -29,6 +29,8 @@ LOG_DIR = r"D:\zkSync_logs"
 LOG_FILES = [
     "logs_69900000_70000000_final.pkl",
     "logs_14900000_15000000_final.pkl",
+    "eth_transfers_69900000_70000000.pkl",
+    "eth_transfers_14900000_15000000.pkl",
 ]
 
 N_SOURCES  = 5000   # BFS source nodes; each reaches ALL nodes in the full graph

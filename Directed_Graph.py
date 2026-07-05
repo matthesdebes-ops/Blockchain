@@ -7,17 +7,25 @@ Streaming pickle loader + full analysis suite:
   • Transaction-volume distribution vs Log-normal, Power-law, Exponential
   • Assortativity coefficient r
   • Volume-degree correlation kept SEPARATE from volume distribution
+
+Edge weights represent USD value, not raw token units. Every ERC-20 Transfer
+log carries its own token contract (`address`) and raw integer `value`. Since
+different tokens have different decimals and different prices, raw values are
+not comparable or summable across tokens. price_enrichment.py converts each
+transfer to USD using the token's on-chain decimals() and DefiLlama's
+historical price at the transfer's block timestamp, so `edge_volumes` /
+edge['weight'] is now a USD amount. See price_enrichment.py for details and
+caching behavior (token_decimals_cache.json, token_price_cache.json,
+unpriced_tokens.json in PLOT_DIR).
 """
 
 import pickle
 import os
 import networkx as nx
 import numpy as np
-from typing import List, Dict, Tuple, Optional, Generator
+from typing import Dict, Generator
 import time
-from scipy import stats
 from scipy.special import erf as _erf
-from scipy.optimize import minimize
 from collections import defaultdict, Counter
 import gc
 import warnings
@@ -26,8 +34,9 @@ import sys
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
 import matplotlib.patches as mpatches
+
+from price_enrichment import enrich_chunk_with_usd, unpriced_summary
 
 # ──────────────────────────────────────────────────────────────────────
 # Configuration
@@ -37,13 +46,15 @@ LOG_DIR   = r"D:\zkSync_logs"
 LOG_FILES = [
     "logs_69900000_70000000_final.pkl",
     "logs_14900000_15000000_final.pkl",
+    "eth_transfers_69900000_70000000.pkl",
+    "eth_transfers_14900000_15000000.pkl",
 ]
 
 COMBINE_RANGES = False
 CHUNK_SIZE     = 10_000
 TAIL_FRACTION  = 0.01      # fraction excluded as heavy tail when fitting
 PLOT_DPI       = 150
-MIN_VOLUME     = 0.0001
+MIN_VOLUME     = 0.01      # USD dust filter (was 0.0001 ETH; adjust to taste)
 PLOT_DIR       = r"D:\zkSync_logs\plots"
 
 os.makedirs(PLOT_DIR, exist_ok=True)
@@ -104,6 +115,7 @@ def process_pickle_streaming(file_path: str):
     loader = StreamingPickleLoader(file_path)
     edge_volumes = defaultdict(float)
     total_logs, chunk_count, metadata = 0, 0, {}
+    priced_logs, zero_price_logs = 0, 0
 
     for item in loader.stream_objects():
         if item['type'] == 'metadata':
@@ -114,15 +126,34 @@ def process_pickle_streaming(file_path: str):
             chunk = item['chunk']
             chunk_count += 1
             total_logs += len(chunk)
+
+            # Attach 'value_usd' to every log: (raw_value / 10**decimals) * price_at_day.
+            # Decimals + historical price are fetched (and cached to disk) as needed.
+            chunk = enrich_chunk_with_usd(chunk)
+
             for log in chunk:
-                s = log.get('from'); r = log.get('to'); v = log.get('value', 0)
-                if s and r and s != r and v > 0:
-                    edge_volumes[(s, r)] += v
+                s = log.get('from'); r = log.get('to')
+                raw_v = log.get('value', 0)
+                usd_v = log.get('value_usd', 0.0)
+                if s and r and s != r and raw_v > 0:
+                    edge_volumes[(s, r)] += usd_v
+                    if usd_v > 0:
+                        priced_logs += 1
+                    else:
+                        zero_price_logs += 1
+
             if chunk_count % 5 == 0:
-                print(f"  Processed {total_logs:,} logs, {len(edge_volumes):,} unique edges")
+                print(f"  Processed {total_logs:,} logs, {len(edge_volumes):,} unique edges "
+                      f"(priced={priced_logs:,}, unpriced={zero_price_logs:,})")
             del chunk; gc.collect()
 
+    n_unpriced_pairs, n_unpriced_logs = unpriced_summary()
     print(f"\nTotal processed: {total_logs:,} logs | Unique edges: {len(edge_volumes):,}")
+    print(f"  Priced transfers: {priced_logs:,}  |  Unpriced (excluded from $ volume): {zero_price_logs:,}")
+    if n_unpriced_logs:
+        print(f"  (Across all files so far: {n_unpriced_pairs:,} token/day pairs with no "
+              f"price found, affecting {n_unpriced_logs:,} transfers — see unpriced_tokens.json)")
+    sys.stdout.flush()
     return edge_volumes, total_logs, metadata
 
 
@@ -136,7 +167,7 @@ def build_graph_from_streaming(file_path: str) -> nx.DiGraph:
     for (s, r), v in edge_volumes.items():
         G.add_edge(s, r, weight=v)
     print(f"  Nodes: {G.number_of_nodes():,}  Edges: {G.number_of_edges():,}  "
-          f"Total vol: {sum(edge_volumes.values()):,.2f} ETH")
+          f"Total vol: ${sum(edge_volumes.values()):,.2f} USD")
     tag = os.path.basename(file_path).replace('.pkl', '')
     _save_graph(G, f"graph_{tag}.gpickle")
     del edge_volumes; gc.collect()
@@ -152,12 +183,15 @@ def build_combined_graph_streaming() -> nx.DiGraph:
         print(f"\nFile {i}/{len(LOG_FILES)}: {fn}")
         for item in StreamingPickleLoader(fn).stream_objects():
             if item['type'] == 'logs':
-                for log in item['chunk']:
-                    s = log.get('from'); r = log.get('to'); v = log.get('value', 0)
-                    if s and r and s != r and v > 0:
-                        edge_volumes[(s, r)] += v
-                total_logs += len(item['chunk'])
-                del item['chunk']; gc.collect()
+                chunk = enrich_chunk_with_usd(item['chunk'])
+                for log in chunk:
+                    s = log.get('from'); r = log.get('to')
+                    raw_v = log.get('value', 0)
+                    usd_v = log.get('value_usd', 0.0)
+                    if s and r and s != r and raw_v > 0:
+                        edge_volumes[(s, r)] += usd_v
+                total_logs += len(chunk)
+                del chunk; gc.collect()
     G = nx.DiGraph()
     for (s, r), v in edge_volumes.items():
         G.add_edge(s, r, weight=v)
@@ -447,7 +481,7 @@ def plot_degree_distributions(G: nx.DiGraph, label: str = "", save_plots: bool =
 
 def plot_volume_distribution(G: nx.DiGraph, label: str = "", save_plots: bool = True):
     print("\n" + "="*70)
-    print("TRANSACTION VOLUME DISTRIBUTION")
+    print("TRANSACTION VOLUME DISTRIBUTION (USD)")
     print("="*70); sys.stdout.flush()
 
     weights = np.array([d['weight'] for *_, d in G.edges(data=True)
@@ -457,8 +491,8 @@ def plot_volume_distribution(G: nx.DiGraph, label: str = "", save_plots: bool = 
 
     bulk, tail = _bulk_tail(weights)
     print(f"  Edges: {len(weights):,}  |  bulk: {len(bulk):,}  tail: {len(tail):,}")
-    print(f"  Min={weights.min():.6f}  Max={weights.max():.2f}  "
-          f"Mean={weights.mean():.4f}  Median={np.median(weights):.4f}")
+    print(f"  Min=${weights.min():.6f}  Max=${weights.max():.2f}  "
+          f"Mean=${weights.mean():.4f}  Median=${np.median(weights):.4f}")
 
     # Fits
     alpha_pl, x_min_pl, logL_pl   = fit_power_law(weights)
@@ -471,7 +505,7 @@ def plot_volume_distribution(G: nx.DiGraph, label: str = "", save_plots: bool = 
     sys.stdout.flush()
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle(f'Transaction Volume Distribution – {label}' if label else 'Transaction Volume Distribution',
+    fig.suptitle(f'Transaction Volume Distribution (USD) – {label}' if label else 'Transaction Volume Distribution (USD)',
                  fontsize=15, fontweight='bold')
 
     # ── CCDF with all three fits ──────────────────────────────────────
@@ -508,7 +542,7 @@ def plot_volume_distribution(G: nx.DiGraph, label: str = "", save_plots: bool = 
 
     ax.set_xlim(sw[0] * 0.9, sw[-1] * 1.1)
     ax.set_ylim(y_lo * 0.5, 2.0)
-    ax.set_xlabel('Volume (ETH)'); ax.set_ylabel('P(X ≥ x)')
+    ax.set_xlabel('Volume (USD)'); ax.set_ylabel('P(X ≥ x)')
     ax.set_title('CCDF  (log-log)'); ax.legend(fontsize=8); ax.grid(True, alpha=0.25)
 
     # ── PDF histogram with fits ───────────────────────────────────────
@@ -541,7 +575,7 @@ def plot_volume_distribution(G: nx.DiGraph, label: str = "", save_plots: bool = 
             ax2.loglog(x_fit[mask], y_ln[mask], 'b-', lw=2, label=f'Log-normal μ={mu_ln:.2f}')
 
     ax2.set_ylim(pdf_lo, pdf_hi)
-    ax2.set_xlabel('Volume (ETH)'); ax2.set_ylabel('PDF')
+    ax2.set_xlabel('Volume (USD)'); ax2.set_ylabel('PDF')
     ax2.set_title('PDF  (log-log)'); ax2.legend(fontsize=8); ax2.grid(True, alpha=0.25)
 
     plt.tight_layout()
@@ -588,7 +622,7 @@ def plot_network_overview(G: nx.DiGraph, label: str = "", save_plots: bool = Tru
 
 def plot_volume_degree_correlation(G: nx.DiGraph, label: str = "", save_plots: bool = True):
     print("\n" + "="*70)
-    print("VOLUME-DEGREE CORRELATION")
+    print("VOLUME-DEGREE CORRELATION (USD)")
     print("="*70); sys.stdout.flush()
 
     node_in_vol  = defaultdict(float)
@@ -622,11 +656,11 @@ def plot_volume_degree_correlation(G: nx.DiGraph, label: str = "", save_plots: b
                  fontsize=15, fontweight='bold')
 
     ax1.loglog(x_in,  y_in,  'o', color='#4C72B0', ms=4, alpha=0.7, label='Median vol per in-degree')
-    ax1.set_xlabel('In-degree'); ax1.set_ylabel('Median incoming volume (ETH)')
+    ax1.set_xlabel('In-degree'); ax1.set_ylabel('Median incoming volume (USD)')
     ax1.set_title('In-degree vs Incoming Volume'); ax1.grid(True, alpha=0.25); ax1.legend()
 
     ax2.loglog(x_out, y_out, 'o', color='#DD8452', ms=4, alpha=0.7, label='Median vol per out-degree')
-    ax2.set_xlabel('Out-degree'); ax2.set_ylabel('Median outgoing volume (ETH)')
+    ax2.set_xlabel('Out-degree'); ax2.set_ylabel('Median outgoing volume (USD)')
     ax2.set_title('Out-degree vs Outgoing Volume'); ax2.grid(True, alpha=0.25); ax2.legend()
 
     plt.tight_layout()
