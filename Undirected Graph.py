@@ -6,16 +6,25 @@ from typing import List, Dict
 import gc
 import random
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 from scipy.stats import linregress
 
 LOG_DIR = r"D:\zkSync_logs"
 
 LOG_FILES = [
-    #"logs_69900000_70000000_final.pkl",
-    #"logs_14900000_15000000_final.pkl",
+    "logs_69900000_70000000_final.pkl",
+    "logs_14900000_15000000_final.pkl",
     "eth_transfers_69900000_70000000.pkl",
     "eth_transfers_14900000_15000000.pkl",
 ]
+
+# Number of highest-degree nodes to remove for the "trimmed" analysis.
+TOP_DEGREE_TRIM_N = 5
+
+# For the power-law fitting: use more points, only exclude extreme tail
+MIN_POINTS_IN_FIT = 10  # Minimum points to use for fitting
+MAX_FIT_FRACTION = 0.85  # Use up to 85% of points (exclude the very end)
+MIN_TAIL_POINTS = 1  # Ensure at least this many points are excluded as "tail"
 
 
 def load_logs(file_path: str) -> List[Dict]:
@@ -44,92 +53,118 @@ def build_graph(logs: List[Dict]) -> nx.Graph:
     return G
 
 
-def analyze_connected_components(G: nx.Graph, label: str):
+def remove_top_degree_nodes(G: nx.Graph, n: int = TOP_DEGREE_TRIM_N) -> nx.Graph:
+    """
+    Return a copy of G with the n highest-degree nodes removed.
+    """
+    if G.number_of_nodes() == 0:
+        return G.copy()
 
+    degrees = dict(G.degree())
+    top_nodes = sorted(degrees, key=degrees.get, reverse=True)[:n]
+
+    print(f"  Removing top {len(top_nodes)} highest-degree nodes:")
+    for node in top_nodes:
+        print(f"    {node}  (degree={degrees[node]:,})")
+
+    G_trimmed = G.copy()
+    G_trimmed.remove_nodes_from(top_nodes)
+
+    print(f"  After trim -> Nodes: {G_trimmed.number_of_nodes():,}, "
+          f"Edges: {G_trimmed.number_of_edges():,}")
+
+    return G_trimmed
+
+
+def fit_power_law_bulk(x: np.ndarray, y: np.ndarray):
+    """
+    Fit log(y) = intercept + slope * log(x) on the bulk of the distribution,
+    excluding only the extreme tail points (last 15% or last 3 points,
+    whichever is larger).
+
+    Returns (slope, intercept, fit_indices) or (None, None, None).
+    """
+    if len(x) < MIN_POINTS_IN_FIT:
+        print(f"  Skipping power-law fit: only {len(x)} points "
+              f"(need >= {MIN_POINTS_IN_FIT}).")
+        return None, None, None
+
+    # Use most of the data, but exclude the extreme tail
+    # Keep at least MIN_POINTS_IN_FIT points and exclude at least MIN_TAIL_POINTS
+    n_fit = min(len(x) - MIN_TAIL_POINTS, int(len(x) * MAX_FIT_FRACTION))
+    n_fit = max(n_fit, MIN_POINTS_IN_FIT)
+
+    # Use the first n_fit points (small to medium component sizes)
+    bx, by = x[:n_fit], y[:n_fit]
+
+    # Remove any zero or negative values
+    valid_mask = (bx > 0) & (by > 0)
+    bx, by = bx[valid_mask], by[valid_mask]
+
+    if len(bx) < 2:
+        print("  Skipping power-law fit: not enough valid positive points.")
+        return None, None, None
+
+    try:
+        slope, intercept, r, p, err = linregress(np.log(bx), np.log(by))
+
+        tail_points = len(x) - len(bx)
+        fit_fraction = len(bx) / len(x) * 100
+
+        print(f"  power-law fit: slope={slope:.3f}, intercept={intercept:.3f}, "
+              f"r^2={r ** 2:.3f}, n_points={len(bx)} ({fit_fraction:.0f}% of data)")
+        return slope, intercept, list(range(len(bx)))
+    except:
+        print("  Power-law fit failed.")
+        return None, None, None
+
+
+def analyze_connected_components(G: nx.Graph, label: str):
     components = list(nx.connected_components(G))
     sizes = np.array([len(c) for c in components])
 
     if len(sizes) == 0:
+        print(f"  No components to plot for {label}")
         return
 
-    sizes = np.sort(sizes)
+    # Exact counts for every distinct component size
+    vals, counts = np.unique(sizes, return_counts=True)
+    x, y = vals.astype(float), counts.astype(float)
 
-    # log bins over dataset only
-    bins = np.logspace(np.log10(max(1, sizes.min())), np.log10(sizes.max()), 30)
-    hist, edges = np.histogram(sizes, bins=bins)
+    # Power-law fit on the bulk (excluding heavy tail)
+    slope, intercept, fit_indices = fit_power_law_bulk(x, y)
 
-    x = np.sqrt(edges[:-1] * edges[1:])
-    y = hist
-
-    mask = y > 0
-    x, y = x[mask], y[mask]
-
-    # ---- bulk only fit (ignore tails entirely) ----
-    q1, q2 = np.percentile(sizes, [10, 90])
-    bulk = sizes[(sizes >= q1) & (sizes <= q2)]
-
-    slope = None
-    intercept = None
-
-    if len(bulk) > 5:
-        bh, be = np.histogram(bulk, bins=12)
-        bx = np.sqrt(be[:-1] * be[1:])
-        by = bh
-
-        m = by > 0
-        bx, by = bx[m], by[m]
-
-        slope, intercept, r, p, err = linregress(np.log(bx), np.log(by))
-        print(f"  power-law (bulk only): slope={slope:.3f}, R2={r*r:.3f}")
-
-    # ---- SINGLE PLOT PER DATASET (DATA ONLY) ----
+    # ---- PLOT ----
     plt.figure(figsize=(7, 5))
 
-    # empirical distribution ONLY
-    plt.loglog(x, y, 'o', label="CC distribution (data)")
+    plt.loglog(x, y, 'o', color='blue', label="CC distribution", markersize=4)
 
-    plt.title(f"Connected Component Distribution - {label}")
-    plt.xlabel("Component size")
-    plt.ylabel("Number of components")
-
-    plt.figure(figsize=(7, 5))
-
-    plt.loglog(x, y, 'o', label="CC distribution")
-
-    plt.title(f"Connected Component Distribution - {label}")
-    plt.xlabel("Component size")
-    plt.ylabel("Number of components")
-
-    # --- POWER LAW (unchanged, optional) ---
-    if slope is not None:
-        x_fit = np.linspace(x.min(), x.max(), 200)
+    if slope is not None and fit_indices is not None:
+        # Plot the fit line over the range of the fitted points
+        x_fit_min = x[fit_indices[0]]
+        x_fit_max = x[fit_indices[-1]]
+        x_fit = np.linspace(x_fit_min, x_fit_max, 100)
         y_fit = np.exp(intercept) * x_fit ** slope
-        plt.loglog(x_fit, y_fit, '-', alpha=0.5, label="bulk fit")
+        plt.loglog(x_fit, y_fit, '-', color='red', linewidth=2,
+                   label=f"Power-law fit (slope={slope:.2f})")
 
+    plt.title(f"Connected Component Distribution - {label}")
+    plt.xlabel("Component size")
+    plt.ylabel("Number of components")
     plt.legend()
 
-    # ----------------------------
-    # CONTROLLED AXIS PADDING (log-safe)
-    # ----------------------------
-
+    # Multiplicative padding for log scale
     x_min, x_max = x.min(), x.max()
     y_min, y_max = y.min(), y.max()
-
-    # multiplicative padding is correct for log scale
     plt.xlim(x_min * 0.8, x_max * 1.2)
     plt.ylim(y_min * 0.8, y_max * 1.2)
 
-    out = f"cc_distribution_{label}.png"
-    import matplotlib.ticker as mticker
-
     ax = plt.gca()
-
-    # force plain numbers instead of scientific notation
     ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
     ax.yaxis.set_minor_formatter(mticker.NullFormatter())
-
-    # force integer-style ticks (rounded, not 10^x labels)
     ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+
+    out = f"cc_distribution_{label}.png"
     plt.savefig(out, dpi=200, bbox_inches="tight")
     plt.close()
 
@@ -137,11 +172,9 @@ def analyze_connected_components(G: nx.Graph, label: str):
 
 
 def main():
-
     random.seed(42)
 
     for file_name in LOG_FILES:
-
         label = file_name.replace(".pkl", "")
 
         logs = load_logs(file_name)
@@ -150,8 +183,16 @@ def main():
         del logs
         gc.collect()
 
+        # ---- Original (full) graph analysis ----
+        print(f"\n[{label}] Full graph:")
         analyze_connected_components(G, label)
 
+        # ---- Trimmed graph: remove top-N highest-degree nodes ----
+        print(f"\n[{label}] Trimmed graph (top {TOP_DEGREE_TRIM_N} degree nodes removed):")
+        G_trimmed = remove_top_degree_nodes(G, TOP_DEGREE_TRIM_N)
+        analyze_connected_components(G_trimmed, f"{label}_trimmed_top{TOP_DEGREE_TRIM_N}")
+
+        del G_trimmed
         del G
         gc.collect()
 

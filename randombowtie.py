@@ -33,35 +33,6 @@ def make_directed_graph(N=50_000, gamma=2.2, seed=41):
 
     return D
 
-
-# -------------------------
-# force negative assortativity
-# -------------------------
-def force_negative_assortativity(G, target=-0.2, max_iter=100):
-    H = G.to_undirected()
-
-    for i in range(max_iter):
-        nx.double_edge_swap(H, nswap=5000, max_tries=50000)
-
-        r = nx.degree_assortativity_coefficient(H)
-        print(f"iter {i}: r={r:.4f}")
-
-        if r < target:
-            break
-
-    # zurück in directed (random orientation optional)
-    D = nx.DiGraph()
-    D.add_nodes_from(H.nodes())
-
-    for u, v in H.edges():
-        if np.random.random() < 0.5:
-            D.add_edge(u, v)
-        else:
-            D.add_edge(v, u)
-
-    return D
-
-
 # -------------------------
 # EXPERIMENT 1
 # -------------------------
@@ -70,15 +41,3 @@ G1 = make_directed_graph()
 print("r =", nx.degree_assortativity_coefficient(G1))
 
 plot_bowtie_summary(G1, label="unconstrained")
-
-
-# -------------------------
-# EXPERIMENT 2
-# -------------------------
-print("\n=== Graph 2 ===")
-G2 = make_directed_graph()
-G2 = force_negative_assortativity(G2)
-
-print("r =", nx.degree_assortativity_coefficient(G2))
-
-plot_bowtie_summary(G2, label="r -0.2")

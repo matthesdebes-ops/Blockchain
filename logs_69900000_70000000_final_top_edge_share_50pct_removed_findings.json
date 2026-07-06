@@ -1,0 +1,15 @@
+{
+  "label": "logs_69900000_70000000_final_top_edge_share_50pct_removed",
+  "lcc_order": 19110,
+  "n_sources_sampled": 19110,
+  "avg_hop_length": 5.233982261393429,
+  "ln_lcc_order": 9.857967037234319,
+  "small_world_ratio": 0.5309393145284687,
+  "diameter": 15,
+  "diameter_is_exact": false,
+  "elapsed_seconds": 294.2168939113617,
+  "removal_method": "top_edge_share",
+  "target_edge_share": 0.5,
+  "actual_edge_share_covered": 0.5025228292833926,
+  "nodes_removed": 4
+}

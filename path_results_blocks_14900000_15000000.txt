@@ -4,7 +4,7 @@ SHORTEST PATH ANALYSIS RESULTS – blocks_14900000_15000000
 
 Total nodes:               355,721
 BFS sources:               5,000
-Average hopcount:          2.1574
+Average hopcount:          2.1500
 Diameter (sampled):        8
-Small-world ratio H/ln(N): 0.1688
+Small-world ratio H/ln(N): 0.1682
 Small-world property:      YES

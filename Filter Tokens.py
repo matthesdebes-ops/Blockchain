@@ -87,21 +87,6 @@ def save_pickle(logs: List[Dict], block_range: Tuple[int, int]):
     print(f"  Saved {len(logs):,} ETH transfers -> {os.path.basename(path)} ({size_mb:.1f} MB)")
 
 
-def save_csv(logs: List[Dict], block_range: Tuple[int, int]):
-    start, end = block_range
-    path = os.path.join(OUTPUT_DIR, f"eth_transfers_{start}_{end}.csv")
-    fieldnames = [
-        "blockNumber", "timestamp", "datetime",
-        "transactionHash", "from", "to", "value", "logIndex", "address",
-    ]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for log in logs:
-            writer.writerow(log)
-    print(f"  Saved CSV -> {os.path.basename(path)}")
-
-
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
@@ -127,7 +112,6 @@ def main():
         print(f"  Found {len(eth_logs):,} native ETH transfers ({pct:.2f}% of all logs)")
 
         save_pickle(eth_logs, block_range)
-        save_csv(eth_logs, block_range)
 
         total_all += len(logs)
         total_eth += len(eth_logs)

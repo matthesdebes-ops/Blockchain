@@ -1,0 +1,13 @@
+{
+  "label": "logs_69900000_70000000_final_top50_removed",
+  "lcc_order": 5525,
+  "n_sources_sampled": 5525,
+  "avg_hop_length": 6.490916674584946,
+  "ln_lcc_order": 8.617038526385954,
+  "small_world_ratio": 0.7532653654395672,
+  "diameter": 19,
+  "diameter_is_exact": false,
+  "elapsed_seconds": 23.060766220092773,
+  "removal_method": "top_k_count",
+  "nodes_removed": 50
+}

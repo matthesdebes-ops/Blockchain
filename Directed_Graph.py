@@ -1,5 +1,5 @@
 """
-analyze_zkSync_chunked.py  (revised)
+analyze_zkSync_chunked.py  (revised with top-5 node removal)
 
 Streaming pickle loader + full analysis suite:
   • Bowtie decomposition  (IN / SCC / OUT / Tubes / Tendrils / Disconnected)
@@ -17,16 +17,26 @@ historical price at the transfer's block timestamp, so `edge_volumes` /
 edge['weight'] is now a USD amount. See price_enrichment.py for details and
 caching behavior (token_decimals_cache.json, token_price_cache.json,
 unpriced_tokens.json in PLOT_DIR).
+
+CHANGELOG (this revision)
+--------------------------
+* Replaced the 50% edge trimming with a simpler top-5 highest-degree node
+  removal. This is faster and more targeted: it removes the most connected
+  hub nodes (exchanges, bridges, routers) to see how they affect the
+  network structure.
+* bowtie_decomposition(): uses O(V+E) multi-source BFS for Tubes instead
+  of the old O(|IN| * (V+E)) per-node BFS loop.
 """
 
 import pickle
 import os
+import heapq
 import networkx as nx
 import numpy as np
-from typing import Dict, Generator
+from typing import Dict, Generator, List, Tuple
 import time
 from scipy.special import erf as _erf
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
 import gc
 import warnings
 warnings.filterwarnings('ignore')
@@ -35,6 +45,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from copy import deepcopy
 
 from price_enrichment import enrich_chunk_with_usd, unpriced_summary
 
@@ -44,8 +55,6 @@ from price_enrichment import enrich_chunk_with_usd, unpriced_summary
 
 LOG_DIR   = r"D:\zkSync_logs"
 LOG_FILES = [
-    "logs_69900000_70000000_final.pkl",
-    "logs_14900000_15000000_final.pkl",
     "eth_transfers_69900000_70000000.pkl",
     "eth_transfers_14900000_15000000.pkl",
 ]
@@ -54,10 +63,15 @@ COMBINE_RANGES = False
 CHUNK_SIZE     = 10_000
 TAIL_FRACTION  = 0.01      # fraction excluded as heavy tail when fitting
 PLOT_DPI       = 150
-MIN_VOLUME     = 0.01      # USD dust filter (was 0.0001 ETH; adjust to taste)
+MIN_VOLUME     = 0.01      # USD dust filter
 PLOT_DIR       = r"D:\zkSync_logs\plots"
+PLOT_DIR_TRIMMED = r"D:\zkSync_logs\plots_trimmed"  # Directory for trimmed graphs
+
+# Number of highest-degree nodes to remove for trimming
+TOP_NODES_TO_REMOVE = 5
 
 os.makedirs(PLOT_DIR, exist_ok=True)
+os.makedirs(PLOT_DIR_TRIMMED, exist_ok=True)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -127,8 +141,7 @@ def process_pickle_streaming(file_path: str):
             chunk_count += 1
             total_logs += len(chunk)
 
-            # Attach 'value_usd' to every log: (raw_value / 10**decimals) * price_at_day.
-            # Decimals + historical price are fetched (and cached to disk) as needed.
+            # Attach 'value_usd' to every log
             chunk = enrich_chunk_with_usd(chunk)
 
             for log in chunk:
@@ -157,7 +170,7 @@ def process_pickle_streaming(file_path: str):
     return edge_volumes, total_logs, metadata
 
 
-def build_graph_from_streaming(file_path: str) -> nx.DiGraph:
+def build_graph_from_streaming(file_path: str, plot_dir: str = None) -> nx.DiGraph:
     t0 = time.time()
     edge_volumes, _, _ = process_pickle_streaming(file_path)
     if not edge_volumes:
@@ -169,13 +182,13 @@ def build_graph_from_streaming(file_path: str) -> nx.DiGraph:
     print(f"  Nodes: {G.number_of_nodes():,}  Edges: {G.number_of_edges():,}  "
           f"Total vol: ${sum(edge_volumes.values()):,.2f} USD")
     tag = os.path.basename(file_path).replace('.pkl', '')
-    _save_graph(G, f"graph_{tag}.gpickle")
+    _save_graph(G, f"graph_{tag}.gpickle", plot_dir or PLOT_DIR)
     del edge_volumes; gc.collect()
     print(f"Graph built in {time.time()-t0:.1f}s"); sys.stdout.flush()
     return G
 
 
-def build_combined_graph_streaming() -> nx.DiGraph:
+def build_combined_graph_streaming(plot_dir: str = None) -> nx.DiGraph:
     t0 = time.time()
     edge_volumes = defaultdict(float)
     total_logs = 0
@@ -196,21 +209,65 @@ def build_combined_graph_streaming() -> nx.DiGraph:
     for (s, r), v in edge_volumes.items():
         G.add_edge(s, r, weight=v)
     print(f"Combined: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
-    _save_graph(G, "graph_combined.gpickle")
+    _save_graph(G, "graph_combined.gpickle", plot_dir or PLOT_DIR)
     del edge_volumes; gc.collect()
     print(f"Done in {time.time()-t0:.1f}s"); sys.stdout.flush()
     return G
 
 
-def _save_graph(G: nx.DiGraph, filename: str):
-    path = os.path.join(PLOT_DIR, filename)
+def _save_graph(G: nx.DiGraph, filename: str, plot_dir: str):
+    path = os.path.join(plot_dir, filename)
     with open(path, 'wb') as f:
         pickle.dump(G, f)
     print(f"  Graph saved: {path}")
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 3.  Distribution fitting helpers
+# 3.  Node removal: top N highest-degree nodes
+# ──────────────────────────────────────────────────────────────────────
+
+def trim_top_degree_nodes(G: nx.DiGraph, n: int = TOP_NODES_TO_REMOVE) -> Tuple[nx.DiGraph, set]:
+    """
+    Remove the n highest-degree nodes (in-degree + out-degree) from the graph.
+    This is useful for checking whether a handful of hub nodes (exchanges,
+    bridges, routers) are responsible for stitching together an otherwise-
+    fragmented network into one giant component.
+    """
+    print(f"\nTrimming top {n} highest-degree nodes...")
+    print(f"  Original: {G.number_of_nodes():,} nodes, {G.number_of_edges():,} edges")
+
+    G_trimmed = G.copy()
+
+    if G_trimmed.number_of_nodes() == 0:
+        print("  Graph has no nodes — nothing to trim.")
+        return G_trimmed, set()
+
+    # Get total degree (in + out) for each node
+    degrees = dict(G_trimmed.degree())
+
+    # Sort nodes by degree (highest first) and take top n
+    top_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)[:n]
+
+    removed_nodes = set()
+
+    print(f"  Removing {len(top_nodes)} highest-degree nodes:")
+    for node, deg in top_nodes:
+        print(f"    {node[:20] if len(node) > 20 else node}  (degree={deg:,})")
+        removed_nodes.add(node)
+
+    # Remove the nodes
+    G_trimmed.remove_nodes_from(removed_nodes)
+
+    print(f"\n  Final trimmed graph:")
+    print(f"    Nodes: {G_trimmed.number_of_nodes():,} (removed {len(removed_nodes):,})")
+    print(f"    Edges: {G_trimmed.number_of_edges():,} "
+          f"({G_trimmed.number_of_edges()/G.number_of_edges()*100:.1f}% of original)")
+
+    return G_trimmed, removed_nodes
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 4.  Distribution fitting helpers
 # ──────────────────────────────────────────────────────────────────────
 
 def _bulk_tail(data, tail_fraction=TAIL_FRACTION):
@@ -259,8 +316,25 @@ def fit_log_normal(x_data, tail_fraction=TAIL_FRACTION):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 4.  Bowtie decomposition
+# 5.  Bowtie decomposition
 # ──────────────────────────────────────────────────────────────────────
+
+def _multi_source_reachable(G: nx.DiGraph, sources) -> set:
+    """
+    All nodes reachable by following successor edges starting from any node
+    in `sources` (a single BFS seeded from every source at once), including
+    the sources themselves.
+    """
+    seen = set(sources)
+    queue = deque(sources)
+    while queue:
+        n = queue.popleft()
+        for succ in G.successors(n):
+            if succ not in seen:
+                seen.add(succ)
+                queue.append(succ)
+    return seen
+
 
 def bowtie_decomposition(G: nx.DiGraph) -> Dict:
     """
@@ -281,28 +355,36 @@ def bowtie_decomposition(G: nx.DiGraph) -> Dict:
     sccs = sorted(nx.strongly_connected_components(G), key=len, reverse=True)
     scc = sccs[0] if sccs else set()
 
-    # Forward reachable from SCC (in giant WCC)
-    G_giant = G.subgraph(giant_wcc)
-    scc_sample = next(iter(scc))
+    scc_sample = next(iter(scc)) if scc else None
+    if scc_sample is None:
+        return {
+            'SCC': set(),
+            'IN': set(),
+            'OUT': set(),
+            'Tubes': set(),
+            'Tendrils': set(),
+            'Disconnected': non_giant,
+        }
+
+    # Materialize the giant-WCC subgraph once
+    G_giant = G.subgraph(giant_wcc).copy()
+
     fwd = nx.descendants(G_giant, scc_sample) | {scc_sample}
-    bwd = nx.descendants(G_giant.reverse(copy=False), scc_sample) | {scc_sample}
+    bwd = nx.descendants(G_giant.reverse(copy=True), scc_sample) | {scc_sample}
 
     IN_nodes  = (bwd - scc) & giant_wcc
     OUT_nodes = (fwd - scc) & giant_wcc
 
-    # Tubes: reachable from IN that can reach OUT, not through SCC
-    # (approximate: IN ∩ bwd_from_OUT in subgraph without SCC)
-    G_no_scc = G_giant.subgraph(giant_wcc - scc)
-    tube_candidates = set()
-    for n in IN_nodes:
-        try:
-            reachable = nx.descendants(G_no_scc, n)
-            if reachable & OUT_nodes:
-                tube_candidates.add(n)
-                tube_candidates |= (reachable & OUT_nodes)
-        except Exception:
-            pass
-    tubes    = tube_candidates - scc - IN_nodes - OUT_nodes
+    # Tubes: nodes on a path that starts at IN_nodes and ends at OUT_nodes
+    G_no_scc = G_giant.subgraph(giant_wcc - scc).copy()
+
+    if IN_nodes and OUT_nodes:
+        reach_from_IN = _multi_source_reachable(G_no_scc, IN_nodes)
+        reach_to_OUT  = _multi_source_reachable(G_no_scc.reverse(copy=True), OUT_nodes)
+        tubes = (reach_from_IN & reach_to_OUT) - scc - IN_nodes - OUT_nodes
+    else:
+        tubes = set()
+
     tendrils = giant_wcc - scc - IN_nodes - OUT_nodes - tubes
     disconnected = non_giant
 
@@ -317,12 +399,12 @@ def bowtie_decomposition(G: nx.DiGraph) -> Dict:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 5.  Plotting
+# 6.  Plotting
 # ──────────────────────────────────────────────────────────────────────
 
-# ── 5a.  Bowtie summary ──────────────────────────────────────────────
+# ── 6a.  Bowtie summary ──────────────────────────────────────────────
 
-def plot_bowtie_summary(G: nx.DiGraph, label: str = "", save_plots: bool = True):
+def plot_bowtie_summary(G: nx.DiGraph, label: str = "", plot_dir: str = PLOT_DIR, save_plots: bool = True):
     print("\n" + "="*70)
     print("BOWTIE DECOMPOSITION")
     print("="*70); sys.stdout.flush()
@@ -333,11 +415,11 @@ def plot_bowtie_summary(G: nx.DiGraph, label: str = "", save_plots: bool = True)
     names  = ['IN', 'SCC\n(Knot)', 'OUT', 'Tubes', 'Tendrils', 'Disconnected']
     keys   = ['IN', 'SCC', 'OUT', 'Tubes', 'Tendrils', 'Disconnected']
     counts = [len(bt[k]) for k in keys]
-    pcts   = [c/N*100 for c in counts]
+    pcts   = [c/N*100 if N > 0 else 0 for c in counts]
     colors = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B2', '#937860']
 
     for k, v in zip(keys, counts):
-        print(f"  {k:15s}: {v:>8,} nodes  ({v/N*100:.1f}%)")
+        print(f"  {k:15s}: {v:>8,} nodes  ({v/N*100 if N > 0 else 0:.1f}%)")
     sys.stdout.flush()
 
     fig, (ax_bow, ax_bar) = plt.subplots(1, 2, figsize=(16, 6),
@@ -355,14 +437,15 @@ def plot_bowtie_summary(G: nx.DiGraph, label: str = "", save_plots: bool = True)
         'OUT': dict(xy=(7.5, 2.0), w=2.0, h=2.0, c='#2e9e6b'),
     }
     for key, r in rects.items():
-        ax_bow.add_patch(mpatches.FancyBboxPatch(
-            r['xy'], r['w'], r['h'],
-            boxstyle="round,pad=0.15", fc=r['c'], alpha=0.92,
-            ec='white', lw=1.5))
-        ax_bow.text(r['xy'][0] + r['w']/2, r['xy'][1] + r['h']/2,
-                    f"{key}\n{len(bt[key]):,}\n({len(bt[key])/N*100:.1f}%)",
-                    ha='center', va='center', fontsize=11,
-                    fontweight='bold', color='white')
+        if key in bt and len(bt[key]) > 0:
+            ax_bow.add_patch(mpatches.FancyBboxPatch(
+                r['xy'], r['w'], r['h'],
+                boxstyle="round,pad=0.15", fc=r['c'], alpha=0.92,
+                ec='white', lw=1.5))
+            ax_bow.text(r['xy'][0] + r['w']/2, r['xy'][1] + r['h']/2,
+                        f"{key}\n{len(bt[key]):,}\n({len(bt[key])/N*100 if N > 0 else 0:.1f}%)",
+                        ha='center', va='center', fontsize=11,
+                        fontweight='bold', color='white')
 
     # Arrows IN→SCC, SCC→OUT
     for x1, x2 in [(2.35, 3.78), (6.22, 7.48)]:
@@ -370,12 +453,12 @@ def plot_bowtie_summary(G: nx.DiGraph, label: str = "", save_plots: bool = True)
                         arrowprops=dict(arrowstyle='->', color='white',
                                         lw=2.5, mutation_scale=18))
 
-    # Tube arc (bypass) — drawn as a Bezier curve above the boxes
+    # Tube arc (bypass)
     from matplotlib.patches import FancyArrowPatch
     tube_arrow = FancyArrowPatch(
         posA=(2.35, 1.8), posB=(7.48, 1.8),
         arrowstyle='->', color='#ff6b6b', lw=1.8, mutation_scale=15,
-        connectionstyle='arc3,rad=0.45',   # positive = arc downward below boxes
+        connectionstyle='arc3,rad=0.45',
         zorder=5)
     ax_bow.add_patch(tube_arrow)
     ax_bow.text(5.0, 0.30, f"Tubes: {len(bt['Tubes']):,}",
@@ -398,18 +481,19 @@ def plot_bowtie_summary(G: nx.DiGraph, label: str = "", save_plots: bool = True)
     x_max = max(counts) if max(counts) > 0 else 1
     for bar, c, p in zip(bars, counts, pcts):
         w = bar.get_width() if bar.get_width() > 0 else 0.5
-        ax_bar.text(w * 1.12, bar.get_y() + bar.get_height()/2,
-                    f'{c:,}  ({p:.1f}%)',
-                    va='center', fontsize=9, color='white')
+        if w > 0:
+            ax_bar.text(w * 1.12, bar.get_y() + bar.get_height()/2,
+                        f'{c:,}  ({p:.1f}%)',
+                        va='center', fontsize=9, color='white')
 
     fig.subplots_adjust(left=0.05, right=0.90, top=0.88, bottom=0.08, wspace=0.35)
-    _save_fig(fig, f"bowtie_{label}", save_plots)
+    _save_fig(fig, f"bowtie_{label}", plot_dir, save_plots)
     return bt
 
 
-# ── 5b.  Degree distributions vs Power-law & Poisson ────────────────
+# ── 6b.  Degree distributions vs Power-law & Poisson ────────────────
 
-def plot_degree_distributions(G: nx.DiGraph, label: str = "", save_plots: bool = True):
+def plot_degree_distributions(G: nx.DiGraph, label: str = "", plot_dir: str = PLOT_DIR, save_plots: bool = True):
     print("\n" + "="*70)
     print("DEGREE DISTRIBUTIONS (log-log)")
     print("="*70); sys.stdout.flush()
@@ -433,7 +517,7 @@ def plot_degree_distributions(G: nx.DiGraph, label: str = "", save_plots: bool =
 
         ax.loglog(xs, ys, 'o', color=col, alpha=0.7, ms=4, label='Empirical', zorder=3)
 
-        # Data bounds — all fits clipped to this range so axes stay on the data
+        # Data bounds
         x_lo, x_hi = xs.min(), xs.max()
         y_lo, y_hi = ys.min() * 0.5, ys.max() * 3.0
 
@@ -452,7 +536,7 @@ def plot_degree_distributions(G: nx.DiGraph, label: str = "", save_plots: bool =
                     ax.loglog(x_fit[mask], y_pl[mask], 'r-', lw=2,
                               label=f'Power law  α={alpha_pl:.2f}')
 
-        # ── Poisson fit (log-stable, clipped to data range) ──
+        # ── Poisson fit ──
         lam = np.mean(deg)
         k_poi = np.arange(max(1, int(x_lo)), min(int(x_hi) + 1, 500))
         log_pmf = (k_poi * np.log(lam) - lam
@@ -463,7 +547,6 @@ def plot_degree_distributions(G: nx.DiGraph, label: str = "", save_plots: bool =
             ax.loglog(k_poi[mask], y_poi[mask], 'g--', lw=1.8,
                       label=f'Poisson  λ={lam:.1f}')
 
-        # Lock axes to the empirical data range — no underflow tails
         ax.set_xlim(x_lo * 0.8, x_hi * 1.5)
         ax.set_ylim(y_lo, y_hi)
         ax.set_xlabel(title)
@@ -474,12 +557,12 @@ def plot_degree_distributions(G: nx.DiGraph, label: str = "", save_plots: bool =
         ax.grid(True, alpha=0.25)
 
     plt.tight_layout()
-    _save_fig(fig, f"degree_distributions_{label}", save_plots)
+    _save_fig(fig, f"degree_distributions_{label}", plot_dir, save_plots)
 
 
-# ── 5c.  Transaction-volume distribution (standalone) ───────────────
+# ── 6c.  Transaction-volume distribution ─────────────────────────────
 
-def plot_volume_distribution(G: nx.DiGraph, label: str = "", save_plots: bool = True):
+def plot_volume_distribution(G: nx.DiGraph, label: str = "", plot_dir: str = PLOT_DIR, save_plots: bool = True):
     print("\n" + "="*70)
     print("TRANSACTION VOLUME DISTRIBUTION (USD)")
     print("="*70); sys.stdout.flush()
@@ -516,10 +599,9 @@ def plot_volume_distribution(G: nx.DiGraph, label: str = "", save_plots: bool = 
 
     x_fit = np.logspace(np.log10(max(weights.min(), 1e-9)), np.log10(weights.max()), 500)
 
-    # y-limits from the empirical data — fit lines clipped to this range
     y_lo = ccdf[ccdf > 0].min()
     y_hi = 1.0
-    # Only plot fit curves where their value is within the data's y-range
+
     if alpha_pl is not None:
         surv_pl = (x_fit / x_min_pl)**(-(alpha_pl-1))
         surv_pl[x_fit < x_min_pl] = 1.0
@@ -579,12 +661,12 @@ def plot_volume_distribution(G: nx.DiGraph, label: str = "", save_plots: bool = 
     ax2.set_title('PDF  (log-log)'); ax2.legend(fontsize=8); ax2.grid(True, alpha=0.25)
 
     plt.tight_layout()
-    _save_fig(fig, f"volume_distribution_{label}", save_plots)
+    _save_fig(fig, f"volume_distribution_{label}", plot_dir, save_plots)
 
 
-# ── 5d.  Network structure overview ──────────────────────────────────
+# ── 6d.  Network structure overview ──────────────────────────────────
 
-def plot_network_overview(G: nx.DiGraph, label: str = "", save_plots: bool = True):
+def plot_network_overview(G: nx.DiGraph, label: str = "", plot_dir: str = PLOT_DIR, save_plots: bool = True):
     print("\n" + "="*70)
     print("NETWORK STRUCTURE OVERVIEW")
     print("="*70); sys.stdout.flush()
@@ -615,12 +697,12 @@ def plot_network_overview(G: nx.DiGraph, label: str = "", save_plots: bool = Tru
         ax.set_xticks(range(1, len(top)+1))
 
     plt.tight_layout()
-    _save_fig(fig, f"network_overview_{label}", save_plots)
+    _save_fig(fig, f"network_overview_{label}", plot_dir, save_plots)
 
 
-# ── 5e.  Volume-degree correlation (separate, independent) ──────────
+# ── 6e.  Volume-degree correlation ──────────────────────────────────
 
-def plot_volume_degree_correlation(G: nx.DiGraph, label: str = "", save_plots: bool = True):
+def plot_volume_degree_correlation(G: nx.DiGraph, label: str = "", plot_dir: str = PLOT_DIR, save_plots: bool = True):
     print("\n" + "="*70)
     print("VOLUME-DEGREE CORRELATION (USD)")
     print("="*70); sys.stdout.flush()
@@ -664,17 +746,17 @@ def plot_volume_degree_correlation(G: nx.DiGraph, label: str = "", save_plots: b
     ax2.set_title('Out-degree vs Outgoing Volume'); ax2.grid(True, alpha=0.25); ax2.legend()
 
     plt.tight_layout()
-    _save_fig(fig, f"volume_degree_corr_{label}", save_plots)
+    _save_fig(fig, f"volume_degree_corr_{label}", plot_dir, save_plots)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 6.  Utility
+# 7.  Utility
 # ──────────────────────────────────────────────────────────────────────
 
-def _save_fig(fig, name: str, save: bool):
+def _save_fig(fig, name: str, plot_dir: str, save: bool):
     if save:
         safe = name.replace(' ', '_').replace('/', '_')
-        path = os.path.join(PLOT_DIR, f"{safe}.png")
+        path = os.path.join(plot_dir, f"{safe}.png")
         fig.savefig(path, dpi=PLOT_DPI, facecolor=fig.get_facecolor())
         print(f"  Plot saved: {path}")
     plt.close(fig)
@@ -682,15 +764,18 @@ def _save_fig(fig, name: str, save: bool):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 7.  Main analysis (all metrics + plots)
+# 8.  Main analysis (all metrics + plots)
 # ──────────────────────────────────────────────────────────────────────
 
-def full_analysis(G: nx.DiGraph, label: str):
+def full_analysis(G: nx.DiGraph, label: str, plot_dir: str = PLOT_DIR,
+                  is_trimmed: bool = False, removed_count: int = 0):
     if G.number_of_nodes() == 0:
         print("Empty graph – skipping analysis"); return
 
     print(f"\n{'#'*70}")
     print(f"  FULL ANALYSIS  –  {label}")
+    if is_trimmed:
+        print(f"  *** TRIMMED GRAPH (removed top {removed_count} nodes) ***")
     print(f"{'#'*70}")
     print(f"  Nodes : {G.number_of_nodes():,}")
     print(f"  Edges : {G.number_of_edges():,}")
@@ -705,23 +790,26 @@ def full_analysis(G: nx.DiGraph, label: str):
         print(f"\n  Assortativity could not be computed: {e}")
 
     # ── Bowtie ──
-    plot_bowtie_summary(G, label)
+    plot_bowtie_summary(G, label, plot_dir)
 
     # ── Degree distributions ──
-    plot_degree_distributions(G, label)
+    plot_degree_distributions(G, label, plot_dir)
 
-    # ── Volume distribution (independent of degree) ──
-    plot_volume_distribution(G, label)
+    # ── Volume distribution ──
+    plot_volume_distribution(G, label, plot_dir)
 
     # ── Component overview ──
-    plot_network_overview(G, label)
+    plot_network_overview(G, label, plot_dir)
+
+    # ── Volume-degree correlation ──
+    plot_volume_degree_correlation(G, label, plot_dir)
 
     print(f"\n  Analysis complete for: {label}")
     sys.stdout.flush()
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 8.  Entry point
+# 9.  Entry point
 # ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -733,6 +821,8 @@ def main():
     print(f"Combine   : {COMBINE_RANGES}")
     print(f"Chunk     : {CHUNK_SIZE:,}")
     print(f"Plot dir  : {PLOT_DIR}")
+    print(f"Trimmed plot dir : {PLOT_DIR_TRIMMED}")
+    print(f"Top nodes to remove : {TOP_NODES_TO_REMOVE}")
     print("="*70); sys.stdout.flush()
 
     if not os.path.exists(LOG_DIR):
@@ -748,15 +838,40 @@ def main():
 
     try:
         if COMBINE_RANGES:
-            G = build_combined_graph_streaming()
-            full_analysis(G, "combined")
-            del G; gc.collect()
+            # Build combined graph
+            G = build_combined_graph_streaming(PLOT_DIR)
+
+            # Analyze original graph
+            full_analysis(G, "combined", PLOT_DIR, is_trimmed=False)
+
+            # Trim top N nodes and analyze
+            G_trimmed, removed_nodes = trim_top_degree_nodes(G, TOP_NODES_TO_REMOVE)
+            full_analysis(G_trimmed, "combined_trimmed", PLOT_DIR_TRIMMED,
+                         is_trimmed=True, removed_count=len(removed_nodes))
+
+            # Save trimmed graph
+            _save_graph(G_trimmed, "graph_combined_trimmed.gpickle", PLOT_DIR_TRIMMED)
+
+            del G, G_trimmed; gc.collect()
         else:
             for fn in LOG_FILES:
-                G = build_graph_from_streaming(fn)
+                # Build original graph
+                G = build_graph_from_streaming(fn, PLOT_DIR)
                 label = fn.replace('.pkl', '').replace('logs_', '')
-                full_analysis(G, label)
-                del G; gc.collect()
+
+                # Analyze original graph
+                full_analysis(G, label, PLOT_DIR, is_trimmed=False)
+
+                # Trim top N nodes and analyze
+                G_trimmed, removed_nodes = trim_top_degree_nodes(G, TOP_NODES_TO_REMOVE)
+                label_trimmed = f"{label}_trimmed_top{TOP_NODES_TO_REMOVE}"
+                full_analysis(G_trimmed, label_trimmed, PLOT_DIR_TRIMMED,
+                             is_trimmed=True, removed_count=len(removed_nodes))
+
+                # Save trimmed graph
+                _save_graph(G_trimmed, f"graph_{label_trimmed}.gpickle", PLOT_DIR_TRIMMED)
+
+                del G, G_trimmed; gc.collect()
                 print("\n" + "-"*70)
 
     except MemoryError:

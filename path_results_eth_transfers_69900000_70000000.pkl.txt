@@ -1,10 +1,10 @@
 ======================================================================
-SHORTEST PATH ANALYSIS RESULTS – blocks_69900000_70000000
+SHORTEST PATH ANALYSIS RESULTS – eth_transfers_69900000_70000000.pkl
 ======================================================================
 
-Total nodes:               28,496
+Total nodes:               24,107
 BFS sources:               5,000
-Average hopcount:          2.4475
-Diameter (sampled):        9
-Small-world ratio H/ln(N): 0.2386
+Average hopcount:          2.1290
+Diameter (sampled):        8
+Small-world ratio H/ln(N): 0.2110
 Small-world property:      YES

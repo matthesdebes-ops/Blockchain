@@ -38,15 +38,13 @@ import gc
 LOG_DIR = r"D:\zkSync_logs"
 
 LOG_FILES = [
-    "logs_69900000_70000000_final.pkl",
-    "logs_14900000_15000000_final.pkl",
     "eth_transfers_69900000_70000000.pkl",
     "eth_transfers_14900000_15000000.pkl",
 ]
 
-N_SOURCES      = 30000
+N_SOURCES      = 5000
 CHUNK_SIZE     = 50000
-TOP_K_REMOVE   = 50
+TOP_K_REMOVE   = 5
 EDGE_SHARE_FRACTION = 0.5   # Part 2: remove the fewest highest-degree nodes covering this share of all edges
 
 RESULTS_DIR    = r"D:\zkSync_logs\results"
